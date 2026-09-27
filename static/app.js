@@ -13,6 +13,10 @@ const ui = {
   presetSelect: $("#preset-select"), settingsToggle: $("#settings-toggle"), settingsPanel: $("#settings-panel"), settingsClose: $("#settings-close"),
   settingsSummary: $("#settings-summary"), resetCustom: $("#reset-custom"), saveAsPreset: $("#save-as-preset"), presetsButton: $("#presets-button"),
   requestStatus: $("#request-status"), tokenOverview: $("#token-overview"),
+  mcpStart: $("#mcp-start"), mcpTools: $("#mcp-tools"), mcpStop: $("#mcp-stop"),
+  mcpStatus: $("#mcp-status"), mcpMessage: $("#mcp-message"), mcpDetails: $("#mcp-details"), mcpToolList: $("#mcp-tool-list"),
+  weatherMcpStart: $("#weather-mcp-start"), weatherMcpTools: $("#weather-mcp-tools"), weatherMcpStop: $("#weather-mcp-stop"),
+  weatherMcpStatus: $("#weather-mcp-status"), weatherMcpMessage: $("#weather-mcp-message"), weatherMcpDetails: $("#weather-mcp-details"), weatherMcpToolList: $("#weather-mcp-tool-list"),
   contextMode: $("#context-mode"), contextStatus: $("#context-status"), contextMetrics: $("#context-metrics"),
   taskDescription: $("#task-description"), taskStage: $("#task-stage"), taskCurrentStep: $("#task-current-step"),
   taskTransitionMode: $("#task-transition-mode"), taskAutopilotStop: $("#task-autopilot-stop"),
@@ -45,6 +49,15 @@ const ui = {
   memorySnapshotDialog: $("#memory-snapshot-dialog"), memorySnapshotClose: $("#memory-snapshot-close"), memorySnapshotContent: $("#memory-snapshot-content"),
   projectShareDialog: $("#project-share-dialog"), projectShareClose: $("#project-share-close"), projectShareOwner: $("#project-share-owner"),
   projectShareList: $("#project-share-list"), projectShareSave: $("#project-share-save"), projectShareError: $("#project-share-error"),
+  schedulerButton: $("#scheduler-button"), schedulerBadge: $("#scheduler-badge"), schedulerDialog: $("#scheduler-dialog"),
+  schedulerClose: $("#scheduler-close"), schedulerRuntimeStatus: $("#scheduler-runtime-status"), schedulerSummary: $("#scheduler-summary"),
+  schedulerEditId: $("#scheduler-edit-id"), schedulerEditorTitle: $("#scheduler-editor-title"), schedulerTaskTitle: $("#scheduler-task-title"),
+  schedulerTaskPrompt: $("#scheduler-task-prompt"), schedulerType: $("#scheduler-type"), schedulerRunAt: $("#scheduler-run-at"),
+  schedulerDelay: $("#scheduler-delay"), schedulerInterval: $("#scheduler-interval"), schedulerIntervalLabel: $("#scheduler-interval-label"),
+  schedulerUseWeather: $("#scheduler-use-weather"), schedulerWeatherTools: $("#scheduler-weather-tools"), schedulerError: $("#scheduler-error"),
+  schedulerReset: $("#scheduler-reset"), schedulerSave: $("#scheduler-save"), schedulerShowTools: $("#scheduler-show-tools"),
+  schedulerMcpTools: $("#scheduler-mcp-tools"), schedulerReadAll: $("#scheduler-read-all"), schedulerTaskList: $("#scheduler-task-list"),
+  schedulerRunsCount: $("#scheduler-runs-count"), schedulerRunList: $("#scheduler-run-list"),
 };
 
 let appState = { conversations: [], projects: [], profiles: [], activeProfileId: null, presets: [], defaults: null, provider: null };
@@ -62,7 +75,14 @@ let audioChunks = [];
 let recordingTimer = null;
 let voiceBusy = false;
 let voiceSubmitAfterTranscription = false;
+let mcpState = { phase: "stopped", connected: false, message: "MCP-сервер не запущен.", server: {} };
+let mcpBusy = false;
+let mcpActiveAction = null;
+let weatherMcpState = { phase: "stopped", connected: false, message: "MCP-сервер не запущен.", server: {} };
+let weatherMcpBusy = false;
+let weatherMcpActiveAction = null;
 let invariantContext = { bundle: { layers: {}, rules: [] }, sets: { user: [], project: [], task: [] } };
+let schedulerState = { scheduler: {}, mcp: {}, tasks: [], runs: [], summary: { unread_count: 0 } };
 
 start().catch(showFatal);
 
@@ -77,6 +97,340 @@ async function start() {
   if (appState.conversations.length) await openConversation(appState.conversations[0].id);
   else renderEmptyWorkspace();
   startVoiceStatusPolling();
+  refreshMcpStatus().catch((error) => renderMcpError(error));
+  refreshWeatherMcpStatus().catch((error) => renderWeatherMcpError(error));
+  refreshSchedulerState().catch(() => {});
+  window.setInterval(() => refreshSchedulerState().catch(() => {}), 10000);
+}
+
+async function refreshSchedulerState() {
+  const data = await api("/api/scheduler/state");
+  schedulerState = data;
+  renderScheduler();
+}
+
+function renderScheduler() {
+  const unread = Number(schedulerState.summary?.unread_count || 0);
+  ui.schedulerBadge.textContent = String(unread);
+  ui.schedulerBadge.hidden = unread === 0;
+  const running = schedulerState.scheduler?.running === true;
+  ui.schedulerRuntimeStatus.textContent = running ? "Работает" : "Остановлен";
+  ui.schedulerRuntimeStatus.className = `mcp-status ${running ? "running" : "stopped"}`;
+  const counts = schedulerState.summary || {};
+  const cards = [
+    ["Заданий", counts.tasks_total || 0],
+    ["Активных", counts.tasks_by_status?.enabled || 0],
+    ["Запусков", counts.runs_total || 0],
+    ["Непрочитанных", unread],
+  ];
+  ui.schedulerSummary.replaceChildren(...cards.map(([label, value]) => {
+    const card = document.createElement("div");
+    const caption = document.createElement("small"); caption.textContent = label;
+    const count = document.createElement("strong"); count.textContent = String(value);
+    card.append(caption, count); return card;
+  }));
+  renderSchedulerTasks();
+  renderSchedulerRuns();
+}
+
+function renderSchedulerTasks() {
+  ui.schedulerTaskList.replaceChildren();
+  if (!schedulerState.tasks?.length) {
+    const empty = document.createElement("div"); empty.className = "scheduler-empty";
+    empty.textContent = "Заданий пока нет. Создайте первое слева или попросите агента в чате.";
+    ui.schedulerTaskList.append(empty); return;
+  }
+  const labels = { enabled: "Активно", paused: "Пауза", completed: "Завершено", missed: "Пропущено" };
+  schedulerState.tasks.forEach((task) => {
+    const card = document.createElement("article"); card.className = `scheduler-task${task.running ? " running" : ""}`;
+    const head = document.createElement("div"); head.className = "scheduler-task-head";
+    const title = document.createElement("strong"); title.textContent = task.title;
+    const status = document.createElement("span"); status.className = `scheduler-task-status ${task.status}`;
+    status.textContent = task.running ? "Выполняется" : (labels[task.status] || task.status);
+    head.append(title, status);
+    const prompt = document.createElement("p"); prompt.className = "scheduler-task-prompt"; prompt.textContent = task.prompt;
+    const meta = document.createElement("div"); meta.className = "scheduler-task-meta";
+    const schedule = task.schedule_type === "interval" ? `каждые ${task.interval_minutes} мин.` : "один раз";
+    [schedule, `следующий: ${formatDate(task.next_run_at, true)}`, ...(task.mcp_servers || [])].forEach((value) => {
+      const item = document.createElement("span"); item.textContent = value; meta.append(item);
+    });
+    const actions = document.createElement("div"); actions.className = "scheduler-task-actions";
+    actions.append(button("Изменить", "secondary", () => editScheduledTask(task)));
+    if (["enabled", "paused"].includes(task.status)) {
+      actions.append(button(task.status === "paused" ? "Включить" : "Пауза", "secondary", () => scheduledTaskAction(task.id, task.status === "paused" ? "resume" : "pause")));
+    }
+    actions.append(
+      button("Запустить сейчас", "primary", () => scheduledTaskAction(task.id, "run-now")),
+      button("Диалог", "secondary", () => openAutomationConversation(task)),
+      button("Удалить", "danger", () => deleteScheduledTask(task)),
+    );
+    card.append(head, prompt, meta, actions); ui.schedulerTaskList.append(card);
+  });
+}
+
+function renderSchedulerRuns() {
+  const runs = schedulerState.runs || [];
+  ui.schedulerRunsCount.textContent = String(runs.length);
+  ui.schedulerRunList.replaceChildren();
+  if (!runs.length) {
+    const empty = document.createElement("div"); empty.className = "scheduler-empty"; empty.textContent = "Запусков пока нет.";
+    ui.schedulerRunList.append(empty); return;
+  }
+  const titles = new Map((schedulerState.tasks || []).map((task) => [task.id, task.title]));
+  runs.slice(0, 30).forEach((run) => {
+    const item = document.createElement("article"); item.className = `scheduler-run ${run.status}${run.unread ? " unread" : ""}`;
+    const head = document.createElement("header");
+    const title = document.createElement("strong"); title.textContent = titles.get(run.task_id) || "Удалённое задание";
+    const state = document.createElement("span"); state.textContent = run.status === "completed" ? "Готово" : run.status === "failed" ? "Ошибка" : "Выполняется";
+    head.append(title, state);
+    const text = document.createElement("p"); text.textContent = run.error || run.result_text || "Ожидаем результат…";
+    const meta = document.createElement("small"); meta.textContent = `${formatDate(run.started_at, true)}${run.duration_ms != null ? ` · ${run.duration_ms} мс` : ""}`;
+    item.append(head, text, meta); ui.schedulerRunList.append(item);
+  });
+}
+
+function resetSchedulerEditor() {
+  ui.schedulerEditId.value = ""; ui.schedulerEditorTitle.textContent = "Новое задание";
+  ui.schedulerTaskTitle.value = ""; ui.schedulerTaskPrompt.value = ""; ui.schedulerType.value = "once";
+  ui.schedulerType.disabled = false; ui.schedulerRunAt.value = ""; ui.schedulerDelay.value = ""; ui.schedulerInterval.value = "60";
+  ui.schedulerUseWeather.checked = false; ui.schedulerWeatherTools.hidden = true;
+  ui.schedulerWeatherTools.querySelectorAll("input").forEach((input) => { input.checked = false; });
+  ui.schedulerIntervalLabel.hidden = true; ui.schedulerSave.textContent = "Добавить"; ui.schedulerError.textContent = "";
+}
+
+function editScheduledTask(task) {
+  ui.schedulerEditId.value = task.id; ui.schedulerEditorTitle.textContent = "Изменить задание";
+  ui.schedulerTaskTitle.value = task.title; ui.schedulerTaskPrompt.value = task.prompt; ui.schedulerType.value = task.schedule_type;
+  ui.schedulerType.disabled = true; ui.schedulerRunAt.value = task.next_run_at ? task.next_run_at.slice(0, 16) : "";
+  ui.schedulerDelay.value = ""; ui.schedulerInterval.value = task.interval_minutes || 60;
+  ui.schedulerIntervalLabel.hidden = task.schedule_type !== "interval";
+  ui.schedulerUseWeather.checked = (task.mcp_servers || []).includes("open-meteo");
+  ui.schedulerWeatherTools.hidden = !ui.schedulerUseWeather.checked;
+  ui.schedulerWeatherTools.querySelectorAll("input").forEach((input) => { input.checked = (task.allowed_tools || []).includes(input.value); });
+  ui.schedulerSave.textContent = "Сохранить"; ui.schedulerError.textContent = "";
+}
+
+function schedulerDependencyPayload() {
+  if (!ui.schedulerUseWeather.checked) return { mcp_servers: [], allowed_tools: [] };
+  return {
+    mcp_servers: ["open-meteo"],
+    allowed_tools: [...ui.schedulerWeatherTools.querySelectorAll("input:checked")].map((input) => input.value),
+  };
+}
+
+async function saveScheduledTask() {
+  ui.schedulerError.textContent = ""; ui.schedulerSave.disabled = true;
+  const editId = ui.schedulerEditId.value;
+  const body = {
+    title: ui.schedulerTaskTitle.value,
+    prompt: ui.schedulerTaskPrompt.value,
+    ...schedulerDependencyPayload(),
+  };
+  if (editId) {
+    if (ui.schedulerRunAt.value) body.next_run_at = ui.schedulerRunAt.value;
+    if (ui.schedulerType.value === "interval") body.interval_minutes = Number(ui.schedulerInterval.value);
+  } else {
+    body.schedule_type = ui.schedulerType.value;
+    if (ui.schedulerRunAt.value) body.run_at = ui.schedulerRunAt.value;
+    if (ui.schedulerDelay.value) body.delay_minutes = Number(ui.schedulerDelay.value);
+    if (body.schedule_type === "interval") body.interval_minutes = Number(ui.schedulerInterval.value);
+    body.settings = readSettings();
+    body.source_conversation_id = activeConversation?.id || null;
+    body.project_id = activeConversation?.project_id || null;
+  }
+  try {
+    await api(editId ? `/api/scheduler/tasks/${editId}` : "/api/scheduler/tasks", { method: editId ? "PATCH" : "POST", body });
+    resetSchedulerEditor(); await refreshSchedulerState(); await refreshState();
+  } catch (error) { ui.schedulerError.textContent = error.message; }
+  finally { ui.schedulerSave.disabled = false; }
+}
+
+async function scheduledTaskAction(taskId, action) {
+  await api(`/api/scheduler/tasks/${taskId}/${action}`, { method: "POST", body: {} });
+  await refreshSchedulerState();
+}
+
+async function openAutomationConversation(task) {
+  if (!task.conversation_id) return;
+  ui.schedulerDialog.close(); await refreshState(); await openConversation(task.conversation_id);
+}
+
+async function deleteScheduledTask(task) {
+  if (!window.confirm(`Удалить расписание «${task.title}» и историю его запусков? Диалог останется.`)) return;
+  await api(`/api/scheduler/tasks/${task.id}`, { method: "DELETE" });
+  if (ui.schedulerEditId.value === task.id) resetSchedulerEditor();
+  await refreshSchedulerState();
+}
+
+async function showSchedulerTools() {
+  const data = await api("/api/scheduler/tools");
+  ui.schedulerMcpTools.replaceChildren(...(data.mcp.tools || []).map((tool) => {
+    const row = document.createElement("code"); row.textContent = `${tool.name} — ${tool.description || ""}`; return row;
+  }));
+  ui.schedulerMcpTools.hidden = false;
+}
+
+async function markSchedulerNotificationsRead() {
+  await api("/api/scheduler/notifications/read", { method: "POST", body: {} });
+  await refreshSchedulerState();
+}
+
+async function refreshWeatherMcpStatus() {
+  const data = await api("/api/weather-mcp/status");
+  weatherMcpState = data.mcp;
+  renderWeatherMcpState();
+}
+
+function renderWeatherMcpState() {
+  const labels = { stopped: "Остановлен", starting: "Запуск…", running: "Подключён", stopping: "Остановка…", error: "Ошибка" };
+  const phase = weatherMcpState.phase || "stopped";
+  ui.weatherMcpStatus.textContent = labels[phase] || phase;
+  ui.weatherMcpStatus.className = `mcp-status ${phase}`;
+  ui.weatherMcpMessage.textContent = weatherMcpState.message || "";
+  ui.weatherMcpMessage.className = `mcp-message${weatherMcpState.error ? " error" : ""}`;
+  const active = weatherMcpState.connected === true;
+  ui.weatherMcpStart.disabled = weatherMcpBusy || active || phase === "starting" || phase === "stopping";
+  ui.weatherMcpTools.disabled = weatherMcpBusy || !active;
+  ui.weatherMcpStop.disabled = weatherMcpBusy || !active;
+  ui.weatherMcpStart.textContent = weatherMcpActiveAction === "start" ? "Запускаем…" : "Запустить MCP";
+  ui.weatherMcpTools.textContent = weatherMcpActiveAction === "tools" ? "Получаем…" : "Получить инструменты";
+  ui.weatherMcpStop.textContent = weatherMcpActiveAction === "stop" ? "Останавливаем…" : "Остановить MCP";
+  const details = [
+    ["Сервер", weatherMcpState.server?.name], ["Версия сервера", weatherMcpState.server?.version],
+    ["Версия протокола", weatherMcpState.protocol_version], ["Инструментов", weatherMcpState.tool_count],
+  ].filter(([, value]) => value !== null && value !== undefined && value !== "");
+  ui.weatherMcpDetails.replaceChildren();
+  details.forEach(([label, value]) => {
+    const term = document.createElement("dt"); term.textContent = label;
+    const description = document.createElement("dd"); description.textContent = String(value);
+    ui.weatherMcpDetails.append(term, description);
+  });
+  ui.weatherMcpDetails.hidden = details.length === 0;
+}
+
+function renderWeatherMcpTools(tools) {
+  ui.weatherMcpToolList.replaceChildren();
+  (tools || []).forEach((tool) => {
+    const item = document.createElement("details"); item.className = "mcp-tool";
+    const heading = document.createElement("summary"); heading.textContent = tool.title ? `${tool.name} · ${tool.title}` : tool.name;
+    const description = document.createElement("p"); description.textContent = tool.description || "Описание не предоставлено.";
+    const schema = document.createElement("pre"); schema.textContent = JSON.stringify(tool.input_schema || {}, null, 2);
+    item.append(heading, description, schema); ui.weatherMcpToolList.append(item);
+  });
+}
+
+function renderWeatherMcpError(error) {
+  if (error.data?.mcp) weatherMcpState = error.data.mcp;
+  weatherMcpState = { ...weatherMcpState, error: error.message || String(error), message: error.message || String(error) };
+  renderWeatherMcpState();
+}
+
+async function runWeatherMcpAction(action) {
+  if (weatherMcpBusy) return;
+  weatherMcpBusy = true; weatherMcpActiveAction = action;
+  if (action === "start") {
+    weatherMcpState = { ...weatherMcpState, phase: "starting", message: "Запускаем Open‑Meteo MCP Server…", error: null };
+    ui.weatherMcpToolList.replaceChildren();
+  } else if (action === "tools") {
+    weatherMcpState = { ...weatherMcpState, message: "Получаем список инструментов…", error: null };
+  } else {
+    weatherMcpState = { ...weatherMcpState, phase: "stopping", message: "Останавливаем MCP-сервер…", error: null };
+  }
+  renderWeatherMcpState();
+  try {
+    const method = action === "tools" ? "GET" : "POST";
+    const data = await api(`/api/weather-mcp/${action}`, { method });
+    weatherMcpState = data.mcp;
+    if (data.mcp.tools) renderWeatherMcpTools(data.mcp.tools);
+    if (action === "stop") ui.weatherMcpToolList.replaceChildren();
+  } catch (error) {
+    renderWeatherMcpError(error);
+  } finally {
+    weatherMcpBusy = false; weatherMcpActiveAction = null; renderWeatherMcpState();
+  }
+}
+
+async function refreshMcpStatus() {
+  const data = await api("/api/mcp/status");
+  mcpState = data.mcp;
+  renderMcpState();
+}
+
+function renderMcpState() {
+  const labels = { stopped: "Остановлен", starting: "Запуск…", running: "Подключён", stopping: "Остановка…", error: "Ошибка" };
+  const phase = mcpState.phase || "stopped";
+  ui.mcpStatus.textContent = labels[phase] || phase;
+  ui.mcpStatus.className = `mcp-status ${phase}`;
+  ui.mcpMessage.textContent = mcpState.message || "";
+  ui.mcpMessage.className = `mcp-message${mcpState.error ? " error" : ""}`;
+  const active = mcpState.connected === true;
+  ui.mcpStart.disabled = mcpBusy || active || phase === "starting" || phase === "stopping";
+  ui.mcpTools.disabled = mcpBusy || !active;
+  ui.mcpStop.disabled = mcpBusy || !active;
+  ui.mcpStart.textContent = mcpActiveAction === "start" ? "Запускаем…" : "Запустить MCP";
+  ui.mcpTools.textContent = mcpActiveAction === "tools" ? "Получаем…" : "Получить инструменты";
+  ui.mcpStop.textContent = mcpActiveAction === "stop" ? "Останавливаем…" : "Остановить MCP";
+
+  const details = [
+    ["Сервер", mcpState.server?.name],
+    ["Версия сервера", mcpState.server?.version],
+    ["Версия протокола", mcpState.protocol_version],
+    ["Рабочая папка", mcpState.workspace],
+    ["Инструментов", mcpState.tool_count],
+  ].filter(([, value]) => value !== null && value !== undefined && value !== "");
+  ui.mcpDetails.replaceChildren();
+  details.forEach(([label, value]) => {
+    const term = document.createElement("dt"); term.textContent = label;
+    const description = document.createElement("dd"); description.textContent = String(value);
+    ui.mcpDetails.append(term, description);
+  });
+  ui.mcpDetails.hidden = details.length === 0;
+}
+
+function renderMcpTools(tools) {
+  ui.mcpToolList.replaceChildren();
+  (tools || []).forEach((tool) => {
+    const item = document.createElement("details"); item.className = "mcp-tool";
+    const heading = document.createElement("summary"); heading.textContent = tool.title ? `${tool.name} · ${tool.title}` : tool.name;
+    const description = document.createElement("p"); description.textContent = tool.description || "Описание не предоставлено.";
+    const schema = document.createElement("pre"); schema.textContent = JSON.stringify(tool.input_schema || {}, null, 2);
+    item.append(heading, description, schema);
+    ui.mcpToolList.append(item);
+  });
+}
+
+function renderMcpError(error) {
+  if (error.data?.mcp) mcpState = error.data.mcp;
+  mcpState = { ...mcpState, error: error.message || String(error), message: error.message || String(error) };
+  renderMcpState();
+}
+
+async function runMcpAction(action) {
+  if (mcpBusy) return;
+  mcpBusy = true;
+  mcpActiveAction = action;
+  if (action === "start") {
+    mcpState = { ...mcpState, phase: "starting", message: "Запускаем Filesystem MCP Server…", error: null };
+    ui.mcpToolList.replaceChildren();
+  } else if (action === "tools") {
+    mcpState = { ...mcpState, message: "Получаем список инструментов…", error: null };
+  } else {
+    mcpState = { ...mcpState, phase: "stopping", message: "Останавливаем MCP-сервер…", error: null };
+  }
+  renderMcpState();
+  try {
+    const method = action === "tools" ? "GET" : "POST";
+    const data = await api(`/api/mcp/${action}`, { method });
+    mcpState = data.mcp;
+    if (action === "tools") renderMcpTools(data.mcp.tools);
+    if (action === "stop") ui.mcpToolList.replaceChildren();
+  } catch (error) {
+    renderMcpError(error);
+  } finally {
+    mcpBusy = false;
+    mcpActiveAction = null;
+    renderMcpState();
+  }
 }
 
 function startVoiceStatusPolling() {
@@ -155,6 +509,7 @@ async function changeActiveProfile() {
   await api("/api/profiles/active", { method: "PATCH", body: { profile_id: ui.profileSelect.value } });
   activeConversation = null;
   await refreshState();
+  await refreshSchedulerState();
   if (appState.conversations.length) await openConversation(appState.conversations[0].id);
   else renderEmptyWorkspace();
 }
@@ -1619,6 +1974,23 @@ ui.newProjectCancel.addEventListener("click", () => { ui.newProjectForm.hidden =
 ui.newProjectForm.addEventListener("submit", (event) => createSidebarProject(event).catch(showError));
 ui.form.addEventListener("submit", submitMessage); ui.input.addEventListener("input", resizeInput);
 ui.voiceButton.addEventListener("click", toggleVoiceRecording);
+ui.mcpStart.addEventListener("click", () => runMcpAction("start"));
+ui.mcpTools.addEventListener("click", () => runMcpAction("tools"));
+ui.mcpStop.addEventListener("click", () => runMcpAction("stop"));
+ui.weatherMcpStart.addEventListener("click", () => runWeatherMcpAction("start"));
+ui.weatherMcpTools.addEventListener("click", () => runWeatherMcpAction("tools"));
+ui.weatherMcpStop.addEventListener("click", () => runWeatherMcpAction("stop"));
+ui.schedulerButton.addEventListener("click", () => { refreshSchedulerState().catch(showError); ui.schedulerDialog.showModal(); });
+ui.schedulerClose.addEventListener("click", () => ui.schedulerDialog.close());
+ui.schedulerType.addEventListener("change", () => { ui.schedulerIntervalLabel.hidden = ui.schedulerType.value !== "interval"; });
+ui.schedulerUseWeather.addEventListener("change", () => {
+  ui.schedulerWeatherTools.hidden = !ui.schedulerUseWeather.checked;
+  if (!ui.schedulerUseWeather.checked) ui.schedulerWeatherTools.querySelectorAll("input").forEach((input) => { input.checked = false; });
+});
+ui.schedulerReset.addEventListener("click", resetSchedulerEditor);
+ui.schedulerSave.addEventListener("click", () => saveScheduledTask());
+ui.schedulerShowTools.addEventListener("click", () => showSchedulerTools().catch(showError));
+ui.schedulerReadAll.addEventListener("click", () => markSchedulerNotificationsRead().catch(showError));
 ui.input.addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); ui.form.requestSubmit(); } });
 ui.chatTitle.addEventListener("change", renameChat); ui.chatTitle.addEventListener("blur", renameChat);
 ui.deleteChat.addEventListener("click", () => deleteChat().catch(showError));

@@ -1,0 +1,7 @@
+{
+  "name": "deepseek-agent-local-mcp",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "2026.8.31"
+  }
+}
